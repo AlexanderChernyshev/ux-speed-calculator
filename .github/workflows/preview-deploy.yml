@@ -1,0 +1,115 @@
+# Step 2 of 2 for PR preview links (step 1 is preview-build.yml).
+#
+# Runs after a successful "Preview build", from this repository's default branch, so it
+# can use the Cloudflare secret even when the PR comes from a fork. It uploads the PR's
+# build output as a new Worker version with the alias "pr-<number>", then comments the
+# preview link on the PR. Uploading a version does not change the live site.
+#
+# Only trusted code from the default branch runs here: the PR's build output is uploaded
+# to Cloudflare as data, never executed in this job, and wrangler.jsonc comes from the
+# default branch rather than from the PR.
+#
+# Setup (repository admin):
+# - Create a Cloudflare API token with "Workers Scripts: Edit" for this account.
+# - Create a GitHub environment named "preview" (Settings > Environments). Add the token
+#   to it as the secret CLOUDFLARE_API_TOKEN, and add required reviewers so a maintainer
+#   approves each preview before it is uploaded.
+
+name: Preview deploy
+
+on:
+  workflow_run:
+    workflows: [Preview build]
+    types: [completed]
+
+permissions:
+  actions: read
+  contents: read
+  pull-requests: write
+
+jobs:
+  deploy:
+    if: >-
+      github.event.workflow_run.conclusion == 'success' &&
+      github.event.workflow_run.event == 'pull_request'
+    runs-on: ubuntu-latest
+    environment: preview
+    concurrency:
+      group: preview-deploy-${{ github.event.workflow_run.head_repository.full_name }}-${{ github.event.workflow_run.head_branch }}
+      cancel-in-progress: true
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version-file: package.json
+          # No dependency cache in a job that holds credentials
+          package-manager-cache: false
+
+      - run: npm ci
+
+      - uses: actions/download-artifact@v8
+        with:
+          name: preview-build
+          path: ${{ runner.temp }}/preview-build
+          run-id: ${{ github.event.workflow_run.id }}
+          github-token: ${{ github.token }}
+
+      # The artifact was produced by PR code, so check the PR number it carries is a
+      # number and belongs to the PR whose commit was built
+      - name: Verify PR
+        id: pr
+        env:
+          GH_TOKEN: ${{ github.token }}
+          HEAD_SHA: ${{ github.event.workflow_run.head_sha }}
+        run: |
+          pr_number="$(cat "$RUNNER_TEMP/preview-build/pr-number")"
+          if ! [[ "$pr_number" =~ ^[0-9]+$ ]]; then
+            echo "::error::Artifact has an invalid PR number"
+            exit 1
+          fi
+          pr_head_sha="$(gh api "repos/$GITHUB_REPOSITORY/pulls/$pr_number" --jq .head.sha)"
+          if [[ "$pr_head_sha" != "$HEAD_SHA" ]]; then
+            echo "::error::PR #$pr_number has newer commits than this build; its next build will deploy instead"
+            exit 1
+          fi
+          echo "number=$pr_number" >> "$GITHUB_OUTPUT"
+
+      - name: Place build output
+        run: mv "$RUNNER_TEMP/preview-build/.output" .output
+
+      - name: Upload preview version
+        id: upload
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          HEAD_SHA: ${{ github.event.workflow_run.head_sha }}
+          PR_NUMBER: ${{ steps.pr.outputs.number }}
+          # Wrangler writes machine-readable results here, including the preview URL
+          WRANGLER_OUTPUT_FILE_PATH: ${{ runner.temp }}/wrangler-output.json
+        run: |
+          # --keep-vars keeps any variables set in the Cloudflare dashboard, so the preview
+          # behaves like production
+          npx wrangler versions upload \
+            --config wrangler.jsonc \
+            --keep-vars \
+            --preview-alias "pr-$PR_NUMBER" \
+            --message "Preview for PR #$PR_NUMBER (${HEAD_SHA:0:7})"
+          url="$(jq -r 'select(.type == "version-upload") | .preview_alias_url // empty' "$WRANGLER_OUTPUT_FILE_PATH")"
+          if [[ -z "$url" ]]; then
+            echo "::error::No preview URL returned. Check that Preview URLs are enabled for the Worker in the Cloudflare dashboard"
+            exit 1
+          fi
+          echo "url=$url" >> "$GITHUB_OUTPUT"
+
+      - name: Comment preview link on PR
+        env:
+          GH_TOKEN: ${{ github.token }}
+          HEAD_SHA: ${{ github.event.workflow_run.head_sha }}
+          PR_NUMBER: ${{ steps.pr.outputs.number }}
+          PREVIEW_URL: ${{ steps.upload.outputs.url }}
+        run: |
+          body="$(printf '**Preview:** %s\n\nBuilt from commit %s. This link updates with each push to the PR.' "$PREVIEW_URL" "${HEAD_SHA:0:7}")"
+          # Edit the previous preview comment rather than adding a new one per push
+          gh pr comment "$PR_NUMBER" --repo "$GITHUB_REPOSITORY" --edit-last --create-if-none --body "$body"

@@ -7,6 +7,11 @@
   "compatibility_flags": ["nodejs_compat"],
   "workers_dev": true,
   "preview_urls": true,
+  // Upload the Nitro build output as is. Nitro adds these same two settings to the config
+  // it generates at build time; they're repeated here so this file alone can upload a
+  // prebuilt output, as the PR preview workflow does (.github/workflows/preview-deploy.yml)
+  "no_bundle": true,
+  "rules": [{ "type": "ESModule", "globs": ["**/*.mjs", "**/*.js"] }],
   "assets": {
     "binding": "ASSETS",
     "directory": "./.output/public",
