@@ -11,3 +11,5 @@ npm start
 ```
 
 ## This project was created with the [Solid CLI](https://github.com/solidjs-community/solid-cli)
+
+<!-- Test commit to check that Cloudflare PR previews run on this PR. Safe to remove. -->
